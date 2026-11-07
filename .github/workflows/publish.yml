@@ -1,5 +1,5 @@
 name: publish twitch lists
-# Every ~5 minutes (GitHub may run it later under load) and on demand: read the Worker's /export, build the small
+# Every ~5 minutes (self-chained, see the chain job; the cron is a fallback; GitHub may run it later under load) and on demand: read the Worker's /export, build the small
 # list files + thumbnail atlases and deploy them to GitHub Pages. Nothing is committed (keeps the repo small),
 # except a once-a-day keepalive so GitHub does not pause the schedule after 60 quiet days.
 # Uses the built-in GITHUB_TOKEN only.
@@ -19,6 +19,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: github-pages
     steps:
@@ -47,3 +48,28 @@ jobs:
         with:
           path: out
       - uses: actions/deploy-pages@v4
+  # Self-chaining backup for the schedule (GitHub has not been running this repo's cron): after every run, wait,
+  # then dispatch this workflow again with the built-in token. Only one chain survives: if another run of this
+  # workflow is already queued/waiting/running, this one does not re-dispatch. Stop it by disabling the workflow
+  # (gh workflow disable publish.yml) or setting the repo variable CHAIN=off.
+  chain:
+    needs: publish
+    if: always() && vars.CHAIN != 'off'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: wait
+        run: sleep 240
+      - name: re-dispatch unless another run is pending
+        run: |
+          others=$(gh run list --workflow publish.yml --limit 30 --json databaseId,status,createdAt \
+            --jq "[.[] | select(.status != \"completed\" and .databaseId != ${{ github.run_id }} and (.createdAt | fromdateiso8601) > (now - 3600))] | length")
+          echo "other open runs: $others"
+          if [ "$others" -gt 0 ]; then echo "another run is pending; it carries the chain"; exit 0; fi
+          gh workflow run publish.yml --ref main
+          echo "dispatched next run"
