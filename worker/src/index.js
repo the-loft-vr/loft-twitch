@@ -248,15 +248,15 @@ async function poll(env, now) {
   }
   // Top now: the most-viewed PG categories that are not already a fixed chip
   const fixedNames = new Set(Object.values(FIXED).flat());
-  const chips = top.filter((g) => !BLOCKED_GAMES.has(g.name) && !fixedNames.has(g.name) && clean(g.name, 22).dropped === 0).slice(0, TOP_NOW);
-  const perTop = {};
-  for (let i = 0; i < chips.length; i++)
-    perTop[8 + i] = mock ? overall.filter((s) => s.g === chips[i].name) : await streams(env, tok, '&game_id=' + chips[i].id, 1);
+  const cands = top.filter((g) => !BLOCKED_GAMES.has(g.name) && !fixedNames.has(g.name) && clean(g.name, 22).dropped === 0).slice(0, TOP_NOW + 2);
+  const perCand = [];
+  for (let i = 0; i < cands.length; i++)
+    perCand.push(mock ? overall.filter((s) => s.g === cands[i].name) : await streams(env, tok, '&game_id=' + cands[i].id, 1));
 
   // every candidate once; PG filter (category, mature flag, content labels)
   const all = new Map();
   const put = (arr) => { for (const s of arr) if (!all.has(s.l)) all.set(s.l, s); };
-  put(overall); Object.values(perLang).forEach(put); Object.values(perFixed).forEach(put); Object.values(perTop).forEach(put);
+  put(overall); Object.values(perLang).forEach(put); Object.values(perFixed).forEach(put); perCand.forEach(put);
   let ccl = {};
   if (!mock) { ccl = await labels(env, tok, [...all.values()].map((s) => s.id), now, 12); }
   const bad = new Set();
@@ -267,6 +267,10 @@ async function poll(env, now) {
     if (hidden) { bad.add(s.l); cclStats.hidden++; }
   }
   const pg = (arr) => (arr || []).filter((s) => !bad.has(s.l));
+  // a Top-now chip needs at least 3 PG streams (e.g. a mature-rated game whose streams are all hidden gets no chip)
+  const chips = [], perTop = {};
+  for (let i = 0; i < cands.length && chips.length < TOP_NOW; i++)
+    if (pg(perCand[i]).length >= 3) { perTop[8 + chips.length] = perCand[i]; chips.push(cands[i]); }
 
   // chip membership bit mask per channel (lets the world filter a language pool by chip)
   const chipOf = (s) => {
