@@ -8,7 +8,9 @@ slots to newly baked channels), then in Unity run LoftR35Twitch.RefreshBakedChan
 """
 import json, sys, urllib.request, datetime
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 500
-d = json.loads(urllib.request.urlopen('https://loft-twitch.theloft.workers.dev/baked?n=%d' % n, timeout=30).read())
+# Cloudflare refuses urllib's default User-Agent (403), so send our own
+req = urllib.request.Request('https://loft-twitch.theloft.workers.dev/baked?n=%d' % n, headers={'User-Agent': 'loft-twitch-pick-baked/1.0'})
+d = json.loads(urllib.request.urlopen(req, timeout=30).read())
 if d.get('mock') or d.get('n', 0) < 50:
     sys.exit('Not enough real data yet (mock=%s, n=%s). Add the Twitch app secrets and let it run for a few days.' % (d.get('mock'), d.get('n')))
 out = {'version': datetime.date.today().isoformat() + '-top%d' % len(d['channels']), 'note': 'top PG channels by viewer-hours', 'channels': d['channels']}
