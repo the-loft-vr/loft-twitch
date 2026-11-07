@@ -1,0 +1,48 @@
+name: publish twitch lists
+# Every ~5 minutes (GitHub may run it later under load) and on demand: read the Worker's /export, build the small
+# list files + thumbnail atlases and deploy them to GitHub Pages. Nothing is committed (keeps the repo small),
+# except a once-a-day keepalive so GitHub does not pause the schedule after 60 quiet days.
+# Uses the built-in GITHUB_TOKEN only.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pillow==11.0.0
+      - name: build
+        run: |
+          curl -fsS --retry 3 --max-time 60 https://loft-twitch.theloft.workers.dev/export -o export.json
+          mkdir -p out && cp site/index.html out/ && cp baked.json out/baked.json
+          python tools/build_site.py export.json out https://moethegreatt.github.io/loft-twitch
+      - name: keepalive (once a day)
+        run: |
+          d=$(date -u +%F)
+          if [ "$(cat keepalive.txt 2>/dev/null)" != "$d" ]; then
+            echo "$d" > keepalive.txt
+            git config user.name "loft-twitch bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add keepalive.txt && git commit -m "keepalive $d" && git push || true
+          fi
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+      - uses: actions/deploy-pages@v4

@@ -1,0 +1,17 @@
+name = "loft-twitch"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[rules]]
+type = "Text"
+globs = ["**/*.txt"]
+fallthrough = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "loft-twitch"
+database_id = "0055918b-367b-45b1-98b2-a4316000cfef"
