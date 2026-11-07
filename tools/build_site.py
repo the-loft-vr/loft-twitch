@@ -30,13 +30,13 @@ def tile_for(entry, font):
             return im.resize((CW, CH), Image.LANCZOS)
         except Exception:
             pass
-    # placeholder (mock data, or no preview yet): purple card with the channel name
-    h = sum(map(ord, entry['l'])) % 60
-    im = Image.new('RGB', (CW, CH), (60 + h, 30 + h // 2, 110 + h))
+    # placeholder (mock data, or no preview yet): the Loft's dark felt green, thin gold frame, cream name
+    h = sum(map(ord, entry['l'])) % 10
+    im = Image.new('RGB', (CW, CH), (16 + h, 24 + h, 19 + h))
     d = ImageDraw.Draw(im)
-    d.rectangle([0, 0, CW - 1, CH - 1], outline=(145, 70, 255), width=3)
+    d.rectangle([0, 0, CW - 1, CH - 1], outline=(201, 163, 94), width=2)
     name = entry.get('d') or entry['l']
-    d.text((CW // 2, CH // 2), name[:16], fill=(255, 255, 255), anchor='mm', font=font)
+    d.text((CW // 2, CH // 2), name[:16], fill=(242, 237, 219), anchor='mm', font=font)
     return im
 
 def pack(key, entries, t, r, chips):
