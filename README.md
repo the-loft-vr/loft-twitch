@@ -5,9 +5,10 @@ Live Twitch lists for THE LOFT (VRChat) media tablet.
 * `worker/` — Cloudflare Worker `loft-twitch` (https://loft-twitch.theloft.workers.dev), cron every 5 min.
   Polls Twitch Helix (needs `TWITCH_CLIENT_ID` / `TWITCH_CLIENT_SECRET` secrets; mock data until then), applies the
   PG filter, keeps sticky slots (`/s/0..299` -> 302 to `https://www.twitch.tv/<login>`, kept while live + 2 h),
-  search `/q?=<words>`, popularity `/baked?n=500`, snapshot `/export`.
+  search `/q?=<words>`, profile pictures (Helix Get Users, cached in D1 7 days, at most 5 calls per run, export field `pi`), popularity `/baked?n=500`, snapshot `/export`.
 * `.github/workflows/publish.yml` — every ~5 min builds `l/*.json` (each < 7000 bytes) and `a/*.jpg` thumbnail atlases
-  (960x864, 5x8 cells of 192x108) and deploys them to https://the-loft-vr.github.io/loft-twitch/ (trusted by VRChat for
+  (960x864, 5x8 cells of 192x108) and `p/*.jpg` streamer profile picture strips (r36: 512x320, 8x5 cells of 64x64, same
+  entry order; the world masks them round) and deploys them to https://the-loft-vr.github.io/loft-twitch/ (trusted by VRChat for
   strings and images). Built-in `GITHUB_TOKEN` only.
 * `baked.json` — channels whose `https://www.twitch.tv/<login>` URL is baked into the world (trusted video host).
   Placeholder until `tools/pick_baked.py` runs with real data.

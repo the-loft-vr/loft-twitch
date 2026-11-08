@@ -6,6 +6,8 @@ Writes (all small enough for the iPad's 8 KB string limit; each list < 7000 byte
   l/c<k>.json        chip k (0..13), all languages, up to 40 streams
   l/l<i>_<p>.json    language pool i (0 en,1 ja,2 zh,3 ru,4 ko,5 fr,6 de,7 ar,8 es,9 other), page p (0..1), up to 40 streams
   a/<list>_<r>.jpg   thumbnail atlas for that list, rotation r (0/1): 5 columns x 8 rows of 192x108, row-major from the top
+  p/<list>_<r>.jpg   r36: streamer profile pictures for that list, same order: 8 columns x 5 rows of 64x64 (512x320),
+                     row-major from the top (entry i -> column i % 8, row i // 8). The world masks them round.
   meta.json          {t, r, mock, chips}
   baked.json         the baked channel list (copied from the repo) for the Unity installer
 The atlas alternates between two names (r) so a player holding the previous list still gets the matching picture.
@@ -14,6 +16,7 @@ import json, os, sys, io, urllib.request, concurrent.futures as cf
 from PIL import Image, ImageDraw, ImageFont
 
 CW, CH, COLS, ROWS = 192, 108, 5, 8
+PW, PCOLS, PROWS = 64, 8, 5          # r36 profile picture strip
 LIMIT = 6900
 CHIPS = 14
 
@@ -39,6 +42,23 @@ def tile_for(entry, font):
     d.text((CW // 2, CH // 2), name[:16], fill=(242, 237, 219), anchor='mm', font=font)
     return im
 
+def avatar_for(entry, font):
+    """r36: the channel's 64x64 profile picture (Worker /export field 'pi'), else a placeholder in the Loft's colours."""
+    pi = entry.get('pi') or ''
+    if pi.startswith('https://static-cdn.jtvnw.net/'):
+        try:
+            im = Image.open(io.BytesIO(fetch(pi))).convert('RGBA')
+            bg = Image.new('RGBA', im.size, (24, 30, 26, 255)); bg.alpha_composite(im)
+            return bg.convert('RGB').resize((PW, PW), Image.LANCZOS)
+        except Exception:
+            pass
+    h = sum(map(ord, entry['l'])) % 10
+    im = Image.new('RGB', (PW, PW), (40 + h * 3, 34 + h * 2, 22 + h))
+    d = ImageDraw.Draw(im)
+    name = (entry.get('d') or entry['l'] or '?').strip() or '?'
+    d.text((PW // 2, PW // 2), name[0].upper(), fill=(242, 222, 170), anchor='mm', font=font)
+    return im
+
 def pack(key, entries, t, r, chips):
     """One list file; titles shrink until it fits LIMIT bytes."""
     tmax = 48
@@ -58,6 +78,7 @@ def main():
     prev = sys.argv[3].rstrip('/') if len(sys.argv) > 3 else ''
     os.makedirs(os.path.join(out, 'l'), exist_ok=True)
     os.makedirs(os.path.join(out, 'a'), exist_ok=True)
+    os.makedirs(os.path.join(out, 'p'), exist_ok=True)
     pr = -1
     if prev:
         try: pr = json.loads(fetch(prev + '/meta.json'))['r']
@@ -79,6 +100,10 @@ def main():
         for e in arr: uniq.setdefault(e['l'], e)
     with cf.ThreadPoolExecutor(16) as ex:
         tiles = dict(zip(uniq.keys(), ex.map(lambda e: tile_for(e, font), uniq.values())))
+    try: pfont = ImageFont.truetype('DejaVuSans-Bold.ttf', 34)
+    except Exception: pfont = ImageFont.load_default()
+    with cf.ThreadPoolExecutor(16) as ex:
+        avatars = dict(zip(uniq.keys(), ex.map(lambda e: avatar_for(e, pfont), uniq.values())))
     sizes = {}
     for key, arr in lists.items():
         body = pack(key, arr, t, r, chips)
@@ -88,13 +113,19 @@ def main():
         for i, e in enumerate(arr[:COLS * ROWS]):
             atlas.paste(tiles[e['l']], ((i % COLS) * CW, (i // COLS) * CH))
         atlas.save(os.path.join(out, 'a', '%s_%d.jpg' % (key, r)), quality=72, optimize=True, progressive=False)
-        # keep the previous rotation's picture for players still holding the previous list
+        strip = Image.new('RGB', (PW * PCOLS, PW * PROWS), (24, 30, 26))
+        for i, e in enumerate(arr[:PCOLS * PROWS]):
+            strip.paste(avatars[e['l']], ((i % PCOLS) * PW, (i // PCOLS) * PW))
+        strip.save(os.path.join(out, 'p', '%s_%d.jpg' % (key, r)), quality=80, optimize=True, progressive=False)
+        # keep the previous rotation's pictures for players still holding the previous list
         if prev and pr >= 0:
-            try: open(os.path.join(out, 'a', '%s_%d.jpg' % (key, pr)), 'wb').write(fetch('%s/a/%s_%d.jpg' % (prev, key, pr)))
-            except Exception: pass
+            for d in ('a', 'p'):
+                try: open(os.path.join(out, d, '%s_%d.jpg' % (key, pr)), 'wb').write(fetch('%s/%s/%s_%d.jpg' % (prev, d, key, pr)))
+                except Exception: pass
     meta = {'t': t, 'r': r, 'mock': snap.get('mock', False), 'chips': chips, 'pg': snap.get('pg'), 'sizes': sizes}
     open(os.path.join(out, 'meta.json'), 'w', encoding='utf-8').write(json.dumps(meta, ensure_ascii=False))
-    print('rotation', r, 'max list bytes', max(sizes.values()), 'lists', len(sizes), 'channels', len(uniq))
+    npi = sum(1 for e in uniq.values() if (e.get('pi') or '').startswith('https://'))
+    print('rotation', r, 'max list bytes', max(sizes.values()), 'lists', len(sizes), 'channels', len(uniq), 'profile pictures', npi)
     assert max(sizes.values()) < 7000
 
 if __name__ == '__main__':

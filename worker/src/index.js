@@ -194,6 +194,57 @@ async function labels(env, tok, ids, now, budget) {
   return cache;
 }
 
+// ---------------------------------------------------------------- r36 profile pictures (Helix Get Users, cached in D1)
+// The world shows a small round streamer picture next to each name. static-cdn.jtvnw.net is not on VRChat's image
+// allowlist, so the GitHub Action downloads them (the "pi" field of /export) and packs them into github.io strips.
+// Cache blob 'pfp' = { user_id: [path, fetchedUnix, seenUnix] }, path = profile_image_url without PFP_CDN ('' = none).
+// A picture is re-read after PFP_TTL, dropped when its channel was not listed for PFP_KEEP; at most `budget` Helix
+// calls (100 ids each) per run, so a cold cache fills over a few runs and a warm one costs ~0-1 call per run.
+const PFP_CDN = 'https://static-cdn.jtvnw.net/';
+const PFP_TTL = 7 * 86400, PFP_KEEP = 3 * 86400, PFP_MAX = 2500, PFP_BUDGET = 5;
+export function pfpWant(cache, ids, now) {
+  const want = [];
+  for (const id of new Set(ids)) {
+    if (!id) continue;
+    const c = cache[id];
+    if (c) c[2] = now;
+    if (!c || c[1] < now - PFP_TTL) want.push(id);
+  }
+  // never-seen ids first, then the stalest
+  return want.sort((a, b) => (cache[a] ? cache[a][1] : -1) - (cache[b] ? cache[b][1] : -1));
+}
+export function pfpStore(cache, users, asked, now) {
+  const got = new Set();
+  for (const u of users || []) {
+    const url = u.profile_image_url || '';
+    cache[u.id] = [url.startsWith(PFP_CDN) ? url.slice(PFP_CDN.length) : '', now, now]; got.add(u.id);
+  }
+  for (const id of asked) if (!got.has(id)) cache[id] = ['', now, now];   // banned / renamed: don't ask again for a week
+}
+export function pfpPrune(cache, now) {
+  for (const k of Object.keys(cache)) if (!Array.isArray(cache[k]) || cache[k][2] < now - PFP_KEEP) delete cache[k];
+  const keys = Object.keys(cache);
+  if (keys.length > PFP_MAX) keys.sort((a, b) => cache[a][2] - cache[b][2]).slice(0, keys.length - PFP_MAX).forEach((k) => delete cache[k]);
+  return cache;
+}
+// the 70x70 variant (Twitch serves -70x70 next to -300x300); '' when unknown
+export function pfpUrl(c) {
+  if (!c || !c[0]) return '';
+  return PFP_CDN + c[0].replace(/-300x300\.(png|jpe?g)$/i, '-70x70.$1');
+}
+async function profilePics(env, tok, ids, now, budget) {
+  const cache = await kvJson(env, 'pfp', {});
+  const want = pfpWant(cache, ids, now);
+  for (let i = 0; i < want.length && budget > 0; i += 100, budget--) {
+    const part = want.slice(i, i + 100);
+    try {
+      const j = await helix(env, 'users?' + part.map((id) => 'id=' + encodeURIComponent(id)).join('&'), tok);
+      pfpStore(cache, j.data, part, now);
+    } catch (e) { break; }   // a failed call never stops the lists
+  }
+  return pfpPrune(cache, now);
+}
+
 // ---------------------------------------------------------------- MOCK data (until the owner adds the Twitch app)
 const MOCK_EXTRA = Array.from({ length: 120 }, (_, i) => 'loftmock_' + String(i + 1).padStart(3, '0'));
 const MOCK_GAMES = ['Just Chatting', 'Music', 'VRChat', 'Fortnite', 'League of Legends', 'Minecraft', 'Art', 'IRL', 'Grand Theft Auto V',
@@ -323,13 +374,21 @@ async function poll(env, now) {
   }
   const fresh = await loadSlots(env);      // a search may have assigned slots meanwhile: start from the newest copy
   const got = assignInto(fresh, need, stillLive, now);
+  // r36: profile pictures of every listed channel (export only: the Action packs them; the small list files never carry them)
+  let pfp = null;
+  if (!mock) {
+    const listedIds = []; for (const arr of Object.values(lists)) for (const s of arr) listedIds.push(s.id);
+    try { pfp = await profilePics(env, tok, listedIds, now, PFP_BUDGET); } catch (e) { pfp = null; }
+  }
   const out = {};
   for (const [k, arr] of Object.entries(lists)) out[k] = arr.map((s) => ({
     l: s.l, d: clean(s.d, 25).text || s.l, t: cleanTitle(s.t, s.g), g: clean(s.g, 28).text, v: s.v, u: s.u, n: s.n, m: chipOf(s), th: s.th,
-    s: BAKED_SET.has(s.l) ? -1 : (got.get(s.l) ?? -1),
+    s: BAKED_SET.has(s.l) ? -1 : (got.get(s.l) ?? -1), pi: pfp ? pfpUrl(pfp[s.id]) : '',
   }));
   const snap = { v: 2, t: now, mock, baked: BAKED.version, chips: chips.map((c) => clean(c.name, 22).text), lists: out, pg: cclStats, excluded: [...excl] };
-  await env.DB.batch([kvStmt(env, 'slots', fresh), kvStmt(env, 'snapshot', snap), kvStmt(env, 'lastPoll', String(now)), kvStmt(env, 'pop', pop)]);
+  const writes = [kvStmt(env, 'slots', fresh), kvStmt(env, 'snapshot', snap), kvStmt(env, 'lastPoll', String(now)), kvStmt(env, 'pop', pop)];
+  if (pfp) writes.push(kvStmt(env, 'pfp', pfp));
+  await env.DB.batch(writes);
   return snap;
 }
 
@@ -406,7 +465,9 @@ export default {
       }
       if (p === '/health' || p === '/') {
         const slots = await loadSlots(env);
+        const pfp = await kvJson(env, 'pfp', {});
         return json({ ok: true, mock: !hasCreds(env), lastPoll: Number(await kvGet(env, 'lastPoll')) || 0, now, slotsUsed: slots.filter((r) => r && r[0]).length,
+          pfpCached: Object.keys(pfp).length,
           slots: SLOTS, graceSeconds: GRACE, baked: BAKED.channels.length, bakedVersion: BAKED.version });
       }
       return new Response('not found', { status: 404 });
