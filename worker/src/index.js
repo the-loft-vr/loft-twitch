@@ -2,7 +2,7 @@
 //
 // Every 5 minutes (cron) it reads Twitch Helix (Get Streams overall, per language and per category, Get Top Games,
 // Get Channel Information for the content labels), drops anything that is not PG, keeps a popularity score per
-// channel, and gives every listed live channel that is NOT baked into the world a sticky "slot" (0..299).
+// channel, and gives every listed live channel that is NOT baked into the world a sticky "slot" (0..999, see slots.js).
 // The world bakes https://loft-twitch.theloft.workers.dev/s/<n> for every slot; /s/<n> answers with a 302 to
 // https://www.twitch.tv/<login>. A channel keeps its slot while it is live and for GRACE seconds after it went
 // offline, so late joiners and other instances open the same stream.
@@ -17,9 +17,8 @@
 
 import BAKED from '../../baked.json';
 import CHARSET from '../../tools/charset.txt';
+import { SLOTS, GRACE, REUSE_COOLDOWN, assignInto, markListed, normalizeSlots } from './slots.js';
 
-const SLOTS = 300;
-const GRACE = 2 * 3600;
 const TITLE_MAX = 48;
 const LIST_MAX = 40;            // entries per published list (one file, < 7 KB)
 const POOL_MAX = 80;            // entries per language pool (two files)
@@ -109,36 +108,8 @@ async function kvJson(env, k, dflt) { const v = await kvGet(env, k); try { retur
 function kvStmt(env, k, v) { return env.DB.prepare('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').bind(k, typeof v === 'string' ? v : JSON.stringify(v)); }
 async function kvSet(env, k, v) { await kvStmt(env, k, v).run(); }
 
-// Sticky slots: blob = array[SLOTS] of [login, seenUnix] or null.
-//   need      = [{login}] listed live channels that want a slot now
-//   stillLive = logins known to be live (their slot's grace clock restarts)
-export function assignInto(slots, need, stillLive, now) {
-  const byLogin = new Map();
-  slots.forEach((r, s) => { if (r && r[0]) byLogin.set(r[0], s); });
-  const touched = new Set();
-  // r36: a holder that is live but no longer listed keeps its clock, but only LISTED channels are protected from eviction
-  for (const l of stillLive) { const s = byLogin.get(l); if (s !== undefined) slots[s][1] = now; }
-  const result = new Map();
-  for (const { login } of need) {
-    if (byLogin.has(login)) { const s = byLogin.get(login); slots[s][1] = now; touched.add(s); result.set(login, s); continue; }
-    let pick = -1, oldest = Infinity;
-    for (let s = 0; s < SLOTS; s++) {
-      const r = slots[s];
-      if (!r || !r[0]) { pick = s; break; }
-      if (!touched.has(s) && r[1] < now - GRACE && r[1] < oldest) { oldest = r[1]; pick = s; }
-    }
-    // r36: all 300 slots held (the owner saw every new channel get -1 and the type box): take the slot of the holder
-    // that is not listed this run and was seen longest ago (offline or off the lists). Listed channels always get a slot.
-    if (pick < 0) {
-      for (let s = 0; s < SLOTS; s++) { const r = slots[s]; if (!touched.has(s) && r[1] < oldest) { oldest = r[1]; pick = s; } }
-    }
-    if (pick < 0) { result.set(login, -1); continue; }
-    if (slots[pick] && slots[pick][0]) byLogin.delete(slots[pick][0]);
-    slots[pick] = [login, now]; byLogin.set(login, pick); touched.add(pick); result.set(login, pick);
-  }
-  return result;
-}
-async function loadSlots(env) { const s = await kvJson(env, 'slots', []); while (s.length < SLOTS) s.push(null); return s.slice(0, SLOTS); }
+// Sticky slots: see slots.js (r37: 1000 slots; a published slot is never reassigned within 30 min)
+async function loadSlots(env) { return normalizeSlots(await kvJson(env, 'slots', []), SLOTS); }
 
 // ---------------------------------------------------------------- Twitch Helix
 function hasCreds(env) { return !!(env.TWITCH_CLIENT_ID && env.TWITCH_CLIENT_SECRET); }
@@ -374,6 +345,7 @@ async function poll(env, now) {
   }
   const fresh = await loadSlots(env);      // a search may have assigned slots meanwhile: start from the newest copy
   const got = assignInto(fresh, need, stillLive, now);
+  markListed(fresh, got, now);   // r37: these slots go out in the lists now: no other channel gets them for 30 min
   // r36: profile pictures of every listed channel (export only: the Action packs them; the small list files never carry them)
   let pfp = null;
   if (!mock) {
@@ -422,7 +394,7 @@ async function search(env, words, now) {
   found = found.filter((c) => !c.bad).sort((a, b) => (b.o - a.o) || (b.v - a.v)).slice(0, 16);
   const need = found.filter((c) => c.o && !BAKED_SET.has(c.l)).map((c) => ({ login: c.l }));
   let got = new Map();
-  if (need.length) { const slots = await loadSlots(env); got = assignInto(slots, need, [], now); await kvSet(env, 'slots', slots); }
+  if (need.length) { const slots = await loadSlots(env); got = assignInto(slots, need, [], now); markListed(slots, got, now); await kvSet(env, 'slots', slots); }
   const r = found.map((c) => ({ l: c.l, d: clean(c.d, 25).text || c.l, t: c.o ? cleanTitle(c.t, c.g) : '', g: clean(c.g, 28).text, v: c.v, u: c.o ? c.u : 0, n: c.n, o: c.o,
     s: BAKED_SET.has(c.l) ? -1 : (got.get(c.l) ?? -1) }));
   return { v: 2, t: now, q: clean(words, 40).text, r };
@@ -438,7 +410,7 @@ export default {
     const now = Math.floor(Date.now() / 1000);
     const p = url.pathname;
     try {
-      const m = p.match(/^\/s\/(\d{1,3})\/?$/);
+      const m = p.match(/^\/s\/(\d{1,4})\/?$/);
       if (m) {
         const n = Number(m[1]);
         const slots = n < SLOTS ? await loadSlots(env) : [];
@@ -466,7 +438,7 @@ export default {
       if (p === '/health' || p === '/') {
         const slots = await loadSlots(env);
         const pfp = await kvJson(env, 'pfp', {});
-        return json({ ok: true, mock: !hasCreds(env), lastPoll: Number(await kvGet(env, 'lastPoll')) || 0, now, slotsUsed: slots.filter((r) => r && r[0]).length,
+        return json({ ok: true, mock: !hasCreds(env), lastPoll: Number(await kvGet(env, 'lastPoll')) || 0, now, slotsUsed: slots.filter((r) => r && r[0]).length, reuseCooldownSeconds: REUSE_COOLDOWN,
           pfpCached: Object.keys(pfp).length,
           slots: SLOTS, graceSeconds: GRACE, baked: BAKED.channels.length, bakedVersion: BAKED.version });
       }
