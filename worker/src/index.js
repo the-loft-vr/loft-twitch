@@ -116,7 +116,8 @@ export function assignInto(slots, need, stillLive, now) {
   const byLogin = new Map();
   slots.forEach((r, s) => { if (r && r[0]) byLogin.set(r[0], s); });
   const touched = new Set();
-  for (const l of stillLive) { const s = byLogin.get(l); if (s !== undefined) { slots[s][1] = now; touched.add(s); } }
+  // r36: a holder that is live but no longer listed keeps its clock, but only LISTED channels are protected from eviction
+  for (const l of stillLive) { const s = byLogin.get(l); if (s !== undefined) slots[s][1] = now; }
   const result = new Map();
   for (const { login } of need) {
     if (byLogin.has(login)) { const s = byLogin.get(login); slots[s][1] = now; touched.add(s); result.set(login, s); continue; }
@@ -125,6 +126,11 @@ export function assignInto(slots, need, stillLive, now) {
       const r = slots[s];
       if (!r || !r[0]) { pick = s; break; }
       if (!touched.has(s) && r[1] < now - GRACE && r[1] < oldest) { oldest = r[1]; pick = s; }
+    }
+    // r36: all 300 slots held (the owner saw every new channel get -1 and the type box): take the slot of the holder
+    // that is not listed this run and was seen longest ago (offline or off the lists). Listed channels always get a slot.
+    if (pick < 0) {
+      for (let s = 0; s < SLOTS; s++) { const r = slots[s]; if (!touched.has(s) && r[1] < oldest) { oldest = r[1]; pick = s; } }
     }
     if (pick < 0) { result.set(login, -1); continue; }
     if (slots[pick] && slots[pick][0]) byLogin.delete(slots[pick][0]);
