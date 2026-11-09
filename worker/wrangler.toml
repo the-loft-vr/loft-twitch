@@ -4,7 +4,7 @@ compatibility_date = "2026-10-01"
 workers_dev = true
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "1,31 * * * *"]
 
 [[rules]]
 type = "Text"

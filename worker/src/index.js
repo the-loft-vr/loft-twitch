@@ -7,6 +7,7 @@
 // https://www.twitch.tv/<login>. A channel keeps its slot while it is live and for GRACE seconds after it went
 // offline, so late joiners and other instances open the same stream.
 //
+//   GET /c/<n>         r40: 302 -> https://clips.twitch.tv/<slug of clip slot n> (0..CLIP_SLOTS-1; a redirect only, never a proxy)
 //   GET /export        full snapshot for the GitHub Action (which writes the small list files + thumbnail atlases)
 //   GET /s/<n>         302 -> https://www.twitch.tv/<login of slot n>   (404 when the slot is free)
 //   GET /q?=<words>    Twitch channel search (the world's input field holds ".../q?=") -> compact JSON (< 7 KB)
@@ -355,13 +356,59 @@ async function poll(env, now) {
   const out = {};
   for (const [k, arr] of Object.entries(lists)) out[k] = arr.map((s) => ({
     l: s.l, d: clean(s.d, 25).text || s.l, t: cleanTitle(s.t, s.g), g: clean(s.g, 28).text, v: s.v, u: s.u, n: s.n, m: chipOf(s), th: s.th,
-    s: BAKED_SET.has(s.l) ? -1 : (got.get(s.l) ?? -1), pi: pfp ? pfpUrl(pfp[s.id]) : '',
+    s: BAKED_SET.has(s.l) ? -1 : (got.get(s.l) ?? -1), pi: pfp ? pfpUrl(pfp[s.id]) : '', gid: s.gid || '',
   }));
   const snap = { v: 2, t: now, mock, baked: BAKED.version, chips: chips.map((c) => clean(c.name, 22).text), lists: out, pg: cclStats, excluded: [...excl] };
+  // r40: clips (refreshed by their own cron every 30 min, see pollClips); per the owner NO world-side PG filter on clips
+  const cl = await kvJson(env, 'clips', null);
+  if (cl && cl.lists) snap.clips = cl.lists;
+  if (!mock) await kvSet(env, 'chipGames', { t: now, top: chips.map((c) => ({ name: c.name, id: c.id })) });
   const writes = [kvStmt(env, 'slots', fresh), kvStmt(env, 'snapshot', snap), kvStmt(env, 'lastPoll', String(now)), kvStmt(env, 'pop', pop)];
   if (pfp) writes.push(kvStmt(env, 'pfp', pfp));
   await env.DB.batch(writes);
   return snap;
+}
+
+// ---------------------------------------------------------------- r40 clips
+// Helix Get Clips (top clips of the last 24 h) per chip category. Runs on its own cron ("1,31 * * * *") so the 5-min list
+// run keeps its subrequest budget. Each listed clip gets a sticky clip slot 0..CLIP_SLOTS-1 (same rules as live slots,
+// slots.js); the world bakes https://loft-twitch.theloft.workers.dev/c/<n>, which answers a 302 to clips.twitch.tv/<slug>.
+// No PG filter on clips (owner, 2026-11-09: "Twitch does it anyway").
+export const CLIP_SLOTS = 200;
+const CLIP_MAX = 20;
+async function pollClips(env, now) {
+  if (!hasCreds(env)) return null;
+  const tok = await token(env, now);
+  const ids = await gameIds(env, tok);
+  const tg = await kvJson(env, 'chipGames', { top: [] });
+  const since = new Date((now - 86400) * 1000).toISOString();
+  const pfp = await kvJson(env, 'pfp', {});
+  const byGame = new Map();
+  const want = new Map();   // game id -> name
+  for (const k of Object.keys(FIXED)) for (const n of FIXED[k]) if (ids[n]) want.set(ids[n], n);
+  for (const g of tg.top || []) if (g.id) want.set(g.id, g.name);
+  for (const [id, name] of want) {
+    try {
+      const j = await helix(env, 'clips?first=' + CLIP_MAX + '&game_id=' + id + '&started_at=' + encodeURIComponent(since), tok);
+      byGame.set(name, (j.data || []).map((c) => ({ id: c.id, l: (c.broadcaster_name || '').toLowerCase(), bid: c.broadcaster_id, d: clean(c.broadcaster_name, 25).text,
+        t: cleanTitle(c.title, name), g: clean(name, 28).text, v: c.view_count || 0, u: Math.floor(Date.parse(c.created_at) / 1000) || 0,
+        du: Math.round(c.duration || 0), th: (c.thumbnail_url || '').replace(/-\d+x\d+\.jpg$/, '-480x272.jpg') })));
+    } catch (e) { /* one category failing never stops the others */ }
+  }
+  const pick = (names) => [...new Map(names.flatMap((n) => byGame.get(n) || []).map((c) => [c.id, c])).values()].sort((a, b) => b.v - a.v).slice(0, CLIP_MAX);
+  const lists = {};
+  lists.c0 = pick([...byGame.keys()]);
+  for (const k of Object.keys(FIXED)) lists['c' + k] = pick(FIXED[k]);
+  lists.c3 = pick((tg.top || []).map((g) => g.name));
+  (tg.top || []).forEach((g, i) => { lists['c' + (8 + i)] = pick([g.name]); });
+  const need = []; const seen = new Set();
+  for (const arr of Object.values(lists)) for (const c of arr) if (!seen.has(c.id)) { seen.add(c.id); need.push({ login: c.id }); }
+  const slots = normalizeSlots(await kvJson(env, 'cslots', []), CLIP_SLOTS);
+  const got = assignInto(slots, need, [], now);
+  markListed(slots, got, now);
+  for (const arr of Object.values(lists)) for (const c of arr) { c.s = got.get(c.id) ?? -1; c.pi = pfpUrl(pfp[c.bid]); delete c.bid; }
+  await env.DB.batch([kvStmt(env, 'cslots', slots), kvStmt(env, 'clips', { t: now, lists })]);
+  return lists;
 }
 
 // ---------------------------------------------------------------- search (players with "Allow Untrusted URLs" on)
@@ -418,6 +465,14 @@ export default {
         if (!row || !row[0]) return new Response('This slot is free right now.', { status: 404, headers: { 'cache-control': 'no-store' } });
         return new Response(null, { status: 302, headers: { location: 'https://www.twitch.tv/' + row[0], 'cache-control': 'no-store' } });
       }
+      const cm = p.match(/^\/c\/(\d{1,3})\/?$/);
+      if (cm) {
+        const n = Number(cm[1]);
+        const slots = n < CLIP_SLOTS ? normalizeSlots(await kvJson(env, 'cslots', []), CLIP_SLOTS) : [];
+        const row = slots[n];
+        if (!row || !row[0]) return new Response('This clip slot is free right now.', { status: 404, headers: { 'cache-control': 'no-store' } });
+        return new Response(null, { status: 302, headers: { location: 'https://clips.twitch.tv/' + encodeURIComponent(row[0]), 'cache-control': 'no-store' } });
+      }
       if (p === '/q' || p === '/q/') {
         let raw = url.search.replace(/^\?/, '');
         raw = raw.startsWith('q=') ? raw.slice(2) : raw.startsWith('=') ? raw.slice(1) : raw;
@@ -448,6 +503,8 @@ export default {
     }
   },
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(poll(env, Math.floor(Date.now() / 1000)));
+    const now = Math.floor(Date.now() / 1000);
+    if (event.cron === '1,31 * * * *') ctx.waitUntil(pollClips(env, now));
+    else ctx.waitUntil(poll(env, now));
   },
 };
