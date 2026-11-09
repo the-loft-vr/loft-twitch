@@ -12,7 +12,7 @@ Writes (all small enough for the iPad's 8 KB string limit; each list < 7000 byte
   baked.json         the baked channel list (copied from the repo) for the Unity installer
 The atlas alternates between two names (r) so a player holding the previous list still gets the matching picture.
 """
-import json, os, sys, io, urllib.request, concurrent.futures as cf
+import json, os, sys, io, urllib.request, urllib.parse, concurrent.futures as cf
 from PIL import Image, ImageDraw, ImageFont
 
 CW, CH, COLS, ROWS = 192, 108, 5, 8
@@ -72,6 +72,138 @@ def pack(key, entries, t, r, chips):
             return body
         tmax -= 6
 
+# ---------------------------------------------------------------- r40: Categories page
+# g/i.json        {t, r, e:[{n: name, c: live streams, v: viewers, s: file slot 0..39}]} by viewers, at most 40
+# g/c_<r>.jpg     box-art covers, 8 columns x 5 rows of 96x128 (768x640), cell = file slot s (column s % 8, row s // 8)
+# g/<s>.json      that category's live streams (same entry format as l/*.json, plus 'n' = the category name)
+# g/a<s>_<r>.jpg, g/p<s>_<r>.jpg   its thumbnail atlas / profile picture strip (same layout as a/ and p/)
+# A category keeps its file slot while it stays listed (read back from the previous site), so a player who opened the
+# page a few minutes ago still gets the category they tapped; the world also checks 'n'.
+# Only channels already in the published lists (PG-filtered by the Worker) are used: every one has a baked link or a slot.
+GCOLS, GROWS, GW, GH, GMAX = 8, 5, 96, 128, 40
+BOXART = 'https://static-cdn.jtvnw.net/ttv-boxart/'
+
+def cover_for(name, gid, font):
+    # by category id (export field 'gid', newer games use the _IGDB form), else by name; Twitch answers unknown ones
+    # with a redirect to its grey "404_boxart" picture, which is skipped
+    tries = []
+    if gid: tries += [str(gid), str(gid) + '_IGDB']
+    if name and not name.endswith('…'): tries.append(urllib.parse.quote(name, safe=''))
+    for key in tries:
+        try:
+            req = urllib.request.Request(BOXART + key + '-%dx%d.jpg' % (GW, GH), headers={'User-Agent': 'loft-twitch-site/1'})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if '404_boxart' in resp.geturl(): continue
+                data = resp.read()
+            im = Image.open(io.BytesIO(data)).convert('RGB')
+            return im if im.size == (GW, GH) else im.resize((GW, GH), Image.LANCZOS)
+        except Exception:
+            pass
+    im = Image.new('RGB', (GW, GH), (19, 40, 29))
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 0, GW - 1, GH - 1], outline=(201, 163, 94), width=2)
+    words, lines, cur = (name or '?').replace('…', '').split(), [], ''
+    for w in words:
+        if len(cur) + len(w) + 1 > 10 and cur: lines.append(cur); cur = w
+        else: cur = (cur + ' ' + w).strip()
+    if cur: lines.append(cur)
+    lines = lines[:4]
+    for i, ln in enumerate(lines):
+        d.text((GW // 2, GH // 2 + (i - (len(lines) - 1) / 2) * 20), ln[:11], fill=(239, 230, 210), anchor='mm', font=font)
+    return im
+
+def build_categories(lists, out, prev, pr, r, t, chips, tiles, avatars, font):
+    os.makedirs(os.path.join(out, 'g'), exist_ok=True)
+    uniq = {}
+    for arr in lists.values():
+        for e in arr: uniq.setdefault(e['l'], e)
+    groups = {}
+    for e in uniq.values():
+        if e.get('g'): groups.setdefault(e['g'], []).append(e)
+    ranked = sorted(groups.items(), key=lambda kv: (-(len(kv[1]) >= 2), -sum(x['v'] for x in kv[1])))[:GMAX]
+    # sticky file slots
+    old = {}
+    if prev:
+        try:
+            for x in json.loads(fetch(prev + '/g/i.json'))['e']: old[x['n']] = x['s']
+        except Exception: old = {}
+    names = [n for n, _ in ranked]
+    slot, used = {}, set()
+    for n in names:
+        if n in old and old[n] not in used and 0 <= old[n] < GMAX: slot[n] = old[n]; used.add(old[n])
+    free = [s for s in range(GMAX) if s not in used]
+    for n in names:
+        if n not in slot: slot[n] = free.pop(0)
+    try: cfont = ImageFont.truetype('DejaVuSans-Bold.ttf', 13)
+    except Exception: cfont = ImageFont.load_default()
+    with cf.ThreadPoolExecutor(16) as ex:
+        covers = dict(zip(names, ex.map(lambda n: cover_for(n, next((x.get('gid') for x in groups[n] if x.get('gid')), ''), cfont), names)))
+    atlas = Image.new('RGB', (GW * GCOLS, GH * GROWS), (19, 40, 29))
+    sizes, index = {}, []
+    for n, arr in ranked:
+        s = slot[n]
+        arr = sorted(arr, key=lambda x: -x['v'])[:40]
+        atlas.paste(covers[n], ((s % GCOLS) * GW, (s // GCOLS) * GH))
+        index.append({'n': n, 'c': len(groups[n]), 'v': sum(x['v'] for x in groups[n]), 's': s})
+        body = pack('g%d' % s, arr, t, r, chips)
+        body = body[:-1] + (',"n":' + json.dumps(n, ensure_ascii=False) + '}').encode('utf-8')
+        open(os.path.join(out, 'g', '%d.json' % s), 'wb').write(body)
+        sizes['g%d' % s] = len(body)
+        ta = Image.new('RGB', (CW * COLS, CH * ROWS), (20, 14, 30))
+        for i, e in enumerate(arr[:COLS * ROWS]): ta.paste(tiles[e['l']], ((i % COLS) * CW, (i // COLS) * CH))
+        ta.save(os.path.join(out, 'g', 'a%d_%d.jpg' % (s, r)), quality=72, optimize=True, progressive=False)
+        st = Image.new('RGB', (PW * PCOLS, PW * PROWS), (24, 30, 26))
+        for i, e in enumerate(arr[:PCOLS * PROWS]): st.paste(avatars[e['l']], ((i % PCOLS) * PW, (i // PCOLS) * PW))
+        st.save(os.path.join(out, 'g', 'p%d_%d.jpg' % (s, r)), quality=80, optimize=True, progressive=False)
+    atlas.save(os.path.join(out, 'g', 'c_%d.jpg' % r), quality=82, optimize=True, progressive=False)
+    ib = json.dumps({'t': t, 'r': r, 'e': index}, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    open(os.path.join(out, 'g', 'i.json'), 'wb').write(ib)
+    sizes['gi'] = len(ib)
+    # the previous rotation's pictures, for players still holding the previous files
+    if prev and pr >= 0:
+        names_prev = ['c_%d.jpg' % pr] + ['%s%d_%d.jpg' % (k, s, pr) for s in range(GMAX) for k in ('a', 'p')]
+        def keep(fn):
+            try: open(os.path.join(out, 'g', fn), 'wb').write(fetch('%s/g/%s' % (prev, fn)))
+            except Exception: pass
+        with cf.ThreadPoolExecutor(16) as ex: list(ex.map(keep, names_prev))
+    print('categories', len(index), 'max bytes', max(sizes.values()))
+    return sizes
+
+# ---------------------------------------------------------------- r40: Clips (only when the Worker exports them)
+# snapshot 'clips': {"c<chip>": [{id, l, d, t, g, v (views), u (created unix), du (seconds), th, pi, s (slot)}]}
+# k/c<chip>.json   {k, t, r, e:[...same keys without th/pi]}, k/a<chip>_<r>.jpg thumbnails (5x8 of 192x108), k/p<chip>_<r>.jpg pictures
+def build_clips(snap, out, prev, pr, r, t, font):
+    clips = snap.get('clips') or {}
+    if not clips: return {}
+    os.makedirs(os.path.join(out, 'k'), exist_ok=True)
+    try: pfont = ImageFont.truetype('DejaVuSans-Bold.ttf', 34)
+    except Exception: pfont = ImageFont.load_default()
+    sizes = {}
+    for key, arr in clips.items():
+        arr = arr[:40]
+        with cf.ThreadPoolExecutor(16) as ex:
+            th = list(ex.map(lambda e: tile_for(e, font), arr))
+            av = list(ex.map(lambda e: avatar_for(e, pfont), arr))
+        tmax = 48
+        while True:
+            e = [{'id': x['id'], 'l': x['l'], 'd': x['d'], 't': x['t'] if len(x['t']) <= tmax else x['t'][:tmax - 1].rstrip() + '…',
+                  'g': x.get('g', ''), 'v': x.get('v', 0), 'u': x.get('u', 0), 'du': x.get('du', 0), 's': x.get('s', -1)} for x in arr]
+            body = json.dumps({'k': key, 't': t, 'r': r, 'e': e}, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            if len(body) <= LIMIT or tmax <= 8: break
+            tmax -= 6
+        open(os.path.join(out, 'k', key + '.json'), 'wb').write(body); sizes['k' + key] = len(body)
+        ta = Image.new('RGB', (CW * COLS, CH * ROWS), (20, 14, 30))
+        for i, im in enumerate(th[:COLS * ROWS]): ta.paste(im, ((i % COLS) * CW, (i // COLS) * CH))
+        ta.save(os.path.join(out, 'k', 'a%s_%d.jpg' % (key[1:], r)), quality=72, optimize=True, progressive=False)
+        st = Image.new('RGB', (PW * PCOLS, PW * PROWS), (24, 30, 26))
+        for i, im in enumerate(av[:PCOLS * PROWS]): st.paste(im, ((i % PCOLS) * PW, (i // PCOLS) * PW))
+        st.save(os.path.join(out, 'k', 'p%s_%d.jpg' % (key[1:], r)), quality=80, optimize=True, progressive=False)
+        if prev and pr >= 0:
+            for d in ('a', 'p'):
+                try: open(os.path.join(out, 'k', '%s%s_%d.jpg' % (d, key[1:], pr)), 'wb').write(fetch('%s/k/%s%s_%d.jpg' % (prev, d, key[1:], pr)))
+                except Exception: pass
+    return sizes
+
 def main():
     snap = json.load(open(sys.argv[1], encoding='utf-8'))
     out = sys.argv[2]
@@ -122,6 +254,9 @@ def main():
             for d in ('a', 'p'):
                 try: open(os.path.join(out, d, '%s_%d.jpg' % (key, pr)), 'wb').write(fetch('%s/%s/%s_%d.jpg' % (prev, d, key, pr)))
                 except Exception: pass
+    gsizes = build_categories(lists, out, prev, pr, r, t, chips, tiles, avatars, font)
+    ksizes = build_clips(snap, out, prev, pr, r, t, font)
+    sizes.update(gsizes); sizes.update(ksizes)
     meta = {'t': t, 'r': r, 'mock': snap.get('mock', False), 'chips': chips, 'pg': snap.get('pg'), 'sizes': sizes}
     open(os.path.join(out, 'meta.json'), 'w', encoding='utf-8').write(json.dumps(meta, ensure_ascii=False))
     npi = sum(1 for e in uniq.values() if (e.get('pi') or '').startswith('https://'))
